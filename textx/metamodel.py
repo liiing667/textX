@@ -20,7 +20,7 @@ from textx.const import (
     RULE_ABSTRACT,
     RULE_MATCH,
 )
-from textx.exceptions import TextXError
+from textx.exceptions import TextXError, TextXSemanticError
 from textx.lang import (
     BASE_TYPE_NAMES,
     BASETYPE,
@@ -172,6 +172,23 @@ class TextXMetaClass(type):
 
     def __repr__(cls):
         return f"<textx:{cls._tx_fqn} class at {id(cls)}>"
+
+
+class _NamedImport:
+    """
+    A grammar imported under an alias (`import "types.tx" as types`).
+
+    Attributes:
+        alias(str): The alias used in the importing grammar.
+        namespace(str): The namespace name of the imported grammar.
+        source(str): The import path as written in the grammar. Used in
+            error messages.
+    """
+
+    def __init__(self, alias: str, namespace: str, source: str) -> None:
+        self.alias = alias
+        self.namespace = namespace
+        self.source = source
 
 
 class TextXMetaModel(DebugPrinter):
@@ -328,6 +345,20 @@ class TextXMetaModel(DebugPrinter):
         # Imported namespaces
         self._imported_namespaces: dict[str | None, Any] = {}
 
+        # Named (aliased) imports. A mapping from namespace name to a dict
+        # of `{alias: _NamedImport}`. Names imported with `as` are visible
+        # only through the alias and do not participate in the flattened
+        # (unqualified) lookup.
+        self._named_imports: dict[str | None, dict[str, _NamedImport]] = {}
+
+        # A stack of namespaces currently being imported. Used to detect
+        # import cycles during meta-model construction.
+        self._import_stack: list[str | None] = []
+
+        # A stack of grammar files currently being processed. Maintained by
+        # `language_from_str` and used to resolve relative file imports.
+        self._file_stack: list[str | None] = []
+
         # Referenced languages
         self.referenced_languages: dict[str, str] = {}
 
@@ -368,6 +399,7 @@ class TextXMetaModel(DebugPrinter):
         # Enter namespace for given file or None if metamodel is
         # constructed from string.
         self._enter_namespace(self._namespace_for_file_name(file_name))
+        self._import_stack.append(self._namespace_stack[-1])
 
     def register_scope_providers(self, sp: dict[str, Any]) -> None:
         self.scope_providers = sp
@@ -394,6 +426,7 @@ class TextXMetaModel(DebugPrinter):
             # BASETYPE namespace is imported in each namespace
             # as the first namespace to be searched.
             self._imported_namespaces[namespace_name] = [self.namespaces["__base__"]]
+            self._named_imports[namespace_name] = {}
 
         self._namespace_stack.append(namespace_name)
 
@@ -403,12 +436,25 @@ class TextXMetaModel(DebugPrinter):
         """
         self._namespace_stack.pop()
 
-    def _new_import(self, import_name: str) -> None:
+    def _new_import(
+        self,
+        import_name: str,
+        import_alias: str | None = None,
+        is_file_path: bool = False,
+    ) -> None:
         """
         Starts a new import.
         Args:
             import_name(str): A relative import in the dot syntax
-                (e.g. "first.second.expressions")
+                (e.g. "first.second.expressions") or, if `is_file_path` is
+                True, a file path relative to the importing grammar file
+                (e.g. "types.tx" or "../common/types.tx").
+            import_alias(str): An optional alias given with `as`. If given,
+                the imported rules are visible only through the alias
+                (e.g. `types.Type`) and do not take part in the flattened
+                (unqualified) lookup of the importing grammar.
+            is_file_path(bool): If True, `import_name` is a file path,
+                otherwise it is a dot-separated module path.
         """
 
         # Import can't be used if meta-model is loaded from string
@@ -416,28 +462,73 @@ class TextXMetaModel(DebugPrinter):
             '"import" statement can not be used if meta-model is loaded from string.'
         )
 
-        # Find the absolute file name of the import based on the relative
-        # import_name and current namespace
         current_namespace = self._namespace_stack[-1]
-        if current_namespace is not None and "." in current_namespace:
-            root_namespace = current_namespace.rsplit(".", 1)[0]
-            import_name = f"{root_namespace}.{import_name}"
 
-        import_file_name = "{}.tx".format(
-            os.path.join(self.root_path, *import_name.split("."))
-        )
+        if is_file_path:
+            # Resolve the path relatively to the importing grammar file.
+            current_file = self._file_stack[-1] if self._file_stack else None
+            base_dir = (
+                os.path.dirname(os.path.abspath(current_file))
+                if current_file
+                else self.root_path
+            )
+            import_file_name = os.path.abspath(os.path.join(base_dir, import_name))
+            namespace = self._namespace_for_file_name(import_file_name)
+        else:
+            # Find the absolute file name of the import based on the relative
+            # import_name and current namespace
+            if current_namespace is not None and "." in current_namespace:
+                root_namespace = current_namespace.rsplit(".", 1)[0]
+                import_name = f"{root_namespace}.{import_name}"
 
-        if import_name not in self.namespaces:
-            self._enter_namespace(import_name)
-            if self.debug:
-                self.dprint(f"*** IMPORTING FILE: {import_file_name}")
-            metamodel_from_file(import_file_name, metamodel=self)
-            self._leave_namespace()
+            namespace = import_name
+            import_file_name = "{}.tx".format(
+                os.path.join(self.root_path, *import_name.split("."))
+            )
 
-        # Add the import to the imported_namespaces for current namespace
-        # so that resolving of current grammar searches imported grammars
-        # in the order of import
-        self._imported_namespaces[current_namespace].append(self.namespaces[import_name])
+        # Detect import cycles during meta-model construction.
+        if namespace in self._import_stack:
+            cycle = self._import_stack[self._import_stack.index(namespace):]
+            cycle = [self._namespace_display_name(n) for n in cycle]
+            cycle.append(self._namespace_display_name(namespace))
+            raise TextXSemanticError(
+                "Import cycle detected: " + " -> ".join(cycle) + "."
+            )
+
+        if namespace not in self.namespaces:
+            self._enter_namespace(namespace)
+            self._import_stack.append(namespace)
+            try:
+                if self.debug:
+                    self.dprint(f"*** IMPORTING FILE: {import_file_name}")
+                metamodel_from_file(import_file_name, metamodel=self)
+            finally:
+                self._import_stack.pop()
+                self._leave_namespace()
+
+        if import_alias:
+            # Register the import under the alias. The imported names are
+            # visible only through the alias in the importing grammar.
+            named_imports = self._named_imports[current_namespace]
+            if import_alias in named_imports:
+                raise TextXSemanticError(
+                    f'Import alias "{import_alias}" is already used '
+                    f'for import "{named_imports[import_alias].source}".'
+                )
+            named_imports[import_alias] = _NamedImport(
+                import_alias, namespace, import_name
+            )
+        else:
+            # Add the import to the imported_namespaces for current namespace
+            # so that resolving of current grammar searches imported grammars
+            # in the order of import
+            self._imported_namespaces[current_namespace].append(
+                self.namespaces[namespace]
+            )
+
+    @staticmethod
+    def _namespace_display_name(namespace: str | None) -> str:
+        return str(namespace) if namespace is not None else "<string>"
 
     def _new_class(
         self,
@@ -647,8 +738,6 @@ class TextXMetaModel(DebugPrinter):
         Called after construction of the main metamodel (not
         imported ones).
         """
-        from textx.exceptions import TextXSemanticError
-
         for user_class in self.user_classes.values():
             if user_class.__name__ not in self._used_rule_names_for_user_classes:
                 # It is not a user class used in the grammar
@@ -663,14 +752,19 @@ class TextXMetaModel(DebugPrinter):
             TextXClass, ParsingExpression
         """
         if "." in name:
-            # Name is fully qualified
-            namespace, name = name.rsplit(".", 1)
+            namespace, short_name = name.rsplit(".", 1)
             if namespace in self.referenced_languages:
                 language = self.referenced_languages[namespace]
                 referenced_metamodel: Any = metamodel_for_language(language)
-                return referenced_metamodel[name]
-            else:
-                return self.namespaces[namespace][name]
+                return referenced_metamodel[short_name]
+            # Name is fully qualified (a namespace path).
+            try:
+                return self.namespaces[namespace][short_name]
+            except KeyError:
+                pass
+            # Try to resolve through aliased imports (e.g. `types.Type` or
+            # chained `b.c.X`) relative to the current namespace.
+            return self._resolve_qualified_name(name)
         else:
             # If not fully qualified search in the current namespace
             # and after that in the imported_namespaces
@@ -682,6 +776,127 @@ class TextXMetaModel(DebugPrinter):
                     return namespace[name]  # type: ignore[index]
 
             raise KeyError(f"{name} metaclass does not exists in the meta-model ")
+
+    def _resolve_qualified_name(self, name: str) -> Any:
+        """
+        Resolve a dotted name through aliased imports relative to the
+        current namespace. Each part but the last is an import alias
+        (e.g. `types.Type` or `b.c.X` for nested imports).
+        Raises KeyError if the name can not be resolved.
+        """
+        parts = name.split(".")
+        namespace = self._namespace_stack[-1]
+        for part in parts[:-1]:
+            named_imports = self._named_imports.get(namespace, {})
+            if part not in named_imports:
+                raise KeyError(name)
+            namespace = named_imports[part].namespace
+        return self._lookup_in_namespace(namespace, parts[-1], name)
+
+    def _lookup_in_namespace(
+        self, namespace: str | None, name: str, full_name: str
+    ) -> Any:
+        """
+        Look up an unqualified name as seen from the given namespace:
+        first in the namespace itself, then in its imported namespaces
+        (in the order of import, builtins first).
+        """
+        ns_classes = self.namespaces[namespace]
+        if name in ns_classes:
+            return ns_classes[name]
+        for imported in self._imported_namespaces[namespace]:
+            if name in imported:
+                return imported[name]
+        raise KeyError(full_name)
+
+    def _unresolved_reference_error(
+        self,
+        name: str,
+        line: int | None,
+        col: int | None,
+        filename: str | None,
+        grammar_rule: str | None = None,
+    ) -> TextXSemanticError:
+        """
+        Construct a TextXSemanticError for a grammar reference that could
+        not be resolved. The message contains the referenced name, the
+        grammar rule the reference appears in, and the namespaces that
+        were searched, in a deterministic order. If the name is defined in
+        aliased (namespaced) imports, the candidate namespaces are listed.
+        """
+        current = self._namespace_stack[-1]
+        ns_names = {id(ns): ns_name for ns_name, ns in self.namespaces.items()}
+        searched: list[str] = []
+        candidates: list[str] = []
+
+        if "." in name:
+            # Describe the aliased import chain resolution attempts.
+            parts = name.split(".")
+            namespace = current
+            chain_ok = True
+            for part in parts[:-1]:
+                named_imports = self._named_imports.get(namespace, {})
+                if part not in named_imports:
+                    searched.append(
+                        f'alias "{part}" in namespace '
+                        f'"{self._namespace_display_name(namespace)}" (no such alias)'
+                    )
+                    chain_ok = False
+                    break
+                namespace = named_imports[part].namespace
+                searched.append(
+                    f'alias "{part}" -> namespace "{namespace}"'
+                )
+            if chain_ok:
+                searched.append(f'namespace "{namespace}" (rule definitions)')
+                for imported in self._imported_namespaces[namespace]:
+                    searched.append(
+                        f'namespace "{ns_names.get(id(imported), "?")}" '
+                        f"(imported by \"{namespace}\")"
+                    )
+            # A fully qualified namespace path is also tried if it differs
+            # from the final namespace of the alias chain.
+            direct_namespace = name.rsplit(".", 1)[0]
+            if not chain_ok or direct_namespace != namespace:
+                searched.append(f'fully qualified namespace "{direct_namespace}"')
+        else:
+            searched.append(
+                f'namespace "{self._namespace_display_name(current)}" (current grammar)'
+            )
+            for imported in self._imported_namespaces[current]:
+                imported_name = ns_names.get(id(imported), "?")
+                if imported_name == "__base__":
+                    searched.append(f'namespace "{imported_name}" (builtins)')
+                else:
+                    searched.append(
+                        f'namespace "{imported_name}" (imported)'
+                    )
+            # Names from aliased imports are not visible without the
+            # prefix. Collect them as candidates.
+            for alias, named_import in self._named_imports.get(current, {}).items():
+                if name in self.namespaces[named_import.namespace]:
+                    candidates.append(alias)
+
+        if len(candidates) > 1:
+            message = (
+                f'Ambiguous reference "{name}": defined in multiple imported '
+                f'namespaces: {", ".join(candidates)}. '
+                f'Use a qualified reference (e.g. "{candidates[0]}.{name}").'
+            )
+        elif candidates:
+            message = (
+                f'Unknown rule "{name}": names imported with "as" are not '
+                f'visible without the namespace prefix. '
+                f'Use "{candidates[0]}.{name}".'
+            )
+        else:
+            message = f'Unexisting rule "{name}".'
+
+        if grammar_rule:
+            message += f' Referenced in rule "{grammar_rule}".'
+        message += " Searched namespaces in order: " + "; ".join(searched) + "."
+
+        return TextXSemanticError(message, line=line, col=col, filename=filename)
 
     def __iter__(self) -> Iterator[type[Any]]:
         """

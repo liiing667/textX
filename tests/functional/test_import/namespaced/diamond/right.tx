@@ -1,0 +1,5 @@
+import "shared.tx" as shared
+
+Right:
+    'right' r=shared.Base
+;

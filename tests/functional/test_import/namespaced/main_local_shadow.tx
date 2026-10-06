@@ -1,0 +1,9 @@
+import "types.tx" as types
+
+Entity:
+    'entity' local=Type imported=types.Type
+;
+
+Type:
+    'localtype' name=ID
+;

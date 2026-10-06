@@ -9,6 +9,7 @@ have named this language textX ;)
 
 from __future__ import annotations
 
+import bisect
 import codecs
 import re
 
@@ -82,7 +83,11 @@ def import_or_reference_stm():
 
 
 def import_stm():
-    return "import", grammar_to_import
+    return "import", grammar_to_import, Optional(import_alias)
+
+
+def import_alias():
+    return "as", ident
 
 
 def reference_stm():
@@ -98,7 +103,15 @@ def language_name():
 
 
 def grammar_to_import():
+    return [dotted_import, string_import]
+
+
+def dotted_import():
     return _(r"(\w|\.)+")
+
+
+def string_import():
+    return string_value
 
 
 # Rules
@@ -184,7 +197,7 @@ def reference():
 
 
 def rule_ref():
-    return ident
+    return qualified_ident
 
 
 # TODO: Remove "|" optional sep in version 4.0.
@@ -222,7 +235,7 @@ def ident():
 
 
 def qualified_ident():
-    return _(r"\w+(\.\w+)?")
+    return _(r"\w+(\.\w+)*")
 
 
 def integer():
@@ -309,14 +322,17 @@ class RuleCrossRef:
             determine attribute type.
         position(int): A position in the input string of this cross-ref.
         rrel_tree: the RREL tree defined for this reference
+        grammar_rule(str): Name of the grammar rule this reference appears
+            in. Used for error reporting.
     """
 
-    def __init__(self, rule_name, cls, position, rrel_tree):
+    def __init__(self, rule_name, cls, position, rrel_tree, grammar_rule=None):
         self.rule_name = rule_name
         self.cls = cls
         self.position = position
         self.suppress = False
         self.scope_provider = None
+        self.grammar_rule = grammar_rule
         if rrel_tree is not None:
             from textx.scoping.rrel import create_rrel_scope_provider
 
@@ -335,18 +351,29 @@ class ClassCrossRef:
     Attributes:
         cls_name(str): A name of the target meta-model class.
         position(int): The position in the input string of this cross-ref.
+        grammar_rule(str): Name of the grammar rule this reference appears
+            in. Used for error reporting.
     """
 
-    def __init__(self, cls_name, position=0):
+    def __init__(self, cls_name, position=0, grammar_rule=None):
         self.cls_name = cls_name
         self.position = position
+        self.grammar_rule = grammar_rule
 
 
 class TextXVisitor(RRELVisitor):
-    def __init__(self, grammar_parser, metamodel):
+    def __init__(self, grammar_parser, metamodel, file_name=None, grammar_def=""):
         self.grammar_parser = grammar_parser
         self.metamodel = metamodel
         self.debug = metamodel.debug
+        # The grammar text and file this visitor is processing. One visitor
+        # is created per grammar file (including imported files), so positions
+        # must be mapped to (line, col) using this exact text. The textX
+        # grammar parser is cached and shared and its input changes as nested
+        # imports are parsed, hence the per-visitor line/col calculation.
+        self.file_name = file_name
+        self._grammar_def = grammar_def
+        self._line_ends = None
 
         # Prepare regex used in keyword-like strmatch detection.
         # See visit_str_match
@@ -356,6 +383,39 @@ class TextXVisitor(RRELVisitor):
         self.keyword_regex = re.compile(r"[^\d\W]\w*", flags)
 
         super().__init__()
+
+    def pos_to_linecol(self, position):
+        """
+        Calculate (line, column) tuple for the given position using the
+        grammar text this visitor processes (which may be an imported file
+        and differs from the shared grammar parser's current input).
+        """
+        if self._line_ends is None:
+            line_ends = []
+            try:
+                line_ends.append(self._grammar_def.index("\n"))
+                while True:
+                    try:
+                        line_ends.append(
+                            self._grammar_def.index("\n", line_ends[-1] + 1)
+                        )
+                    except ValueError:
+                        break
+            except ValueError:
+                pass
+            self._line_ends = line_ends
+
+        line = bisect.bisect_left(self._line_ends, position)
+        col = position
+        if line > 0:
+            col -= self._line_ends[line - 1]
+            if self._grammar_def[self._line_ends[line - 1]] in "\n\r":
+                col -= 1
+        return line + 1, col + 1
+
+    @property
+    def _current_filename(self):
+        return self.file_name or self.metamodel.file_name
 
     def visit_textx_model(self, node, children):
         if "Comment" in self.metamodel:
@@ -418,7 +478,7 @@ class TextXVisitor(RRELVisitor):
             position = user_data.get("position")
             rule_name = user_data.get("rule_name") or node.rule_name
             if position is not None:
-                line, col = self.grammar_parser.pos_to_linecol(position)
+                line, col = self.pos_to_linecol(position)
             else:
                 line = col = None
             raise TextXSemanticError(
@@ -463,12 +523,13 @@ class TextXVisitor(RRELVisitor):
                         )
                         rule._tx_class = _tx_class
                 else:
-                    line, col = grammar_parser.pos_to_linecol(rule.position)
-                    raise TextXSemanticError(
-                        f'Unexisting rule "{rule.rule_name}" at position {(line, col)}.',
-                        line,
-                        col,
-                        filename=model_parser.metamodel.file_name,
+                    line, col = self.pos_to_linecol(rule.position)
+                    raise model_parser.metamodel._unresolved_reference_error(
+                        rule.rule_name,
+                        line=line,
+                        col=col,
+                        filename=self._current_filename,
+                        grammar_rule=rule.grammar_rule,
                     )
 
             assert isinstance(rule, ParsingExpression), f"{type(rule)}:{str(rule)}"
@@ -600,12 +661,13 @@ class TextXVisitor(RRELVisitor):
                 try:
                     cls = metamodel[cls.cls_name]
                 except KeyError as e:
-                    line, col = grammar_parser.pos_to_linecol(cls.position)
-                    raise TextXSemanticError(
-                        f'Unknown class/rule "{cls.cls_name}".',
+                    line, col = self.pos_to_linecol(cls.position)
+                    raise metamodel._unresolved_reference_error(
+                        cls.cls_name,
                         line=line,
                         col=col,
-                        filename=metamodel.file_name,
+                        filename=self._current_filename,
+                        grammar_rule=cls.grammar_rule,
                     ) from e
             resolved_classes[to_resolve] = cls
 
@@ -650,7 +712,25 @@ class TextXVisitor(RRELVisitor):
             _resolve_cls(cls)
 
     def visit_import_stm(self, node, children):
-        self.metamodel._new_import(children[0])
+        import_kind, import_name = children[0]
+        import_alias = children[1] if len(children) > 1 else None
+        try:
+            self.metamodel._new_import(
+                import_name,
+                import_alias=import_alias,
+                is_file_path=(import_kind == "path"),
+            )
+        except TextXSemanticError as e:
+            # Report import errors (e.g. import cycles) at the place of
+            # the import statement in the importing grammar.
+            if e.line is None:
+                e.line, e.col = self.pos_to_linecol(node.position)
+            if e.filename is None:
+                e.filename = self._current_filename
+            raise
+
+    def visit_import_alias(self, node, children):
+        return children[0]
 
     def visit_reference_stm(self, node, children):
         if len(children) > 1:
@@ -661,7 +741,19 @@ class TextXVisitor(RRELVisitor):
         self.metamodel.referenced_languages[language_alias] = language_name
 
     def visit_grammar_to_import(self, node, children):
-        return str(node)
+        return children[0]
+
+    def visit_dotted_import(self, node, children):
+        return ("module", str(node))
+
+    def visit_string_import(self, node, children):
+        value = children[0]
+        # When `string_value` is the only sub-rule it gets reduced and the
+        # raw terminal (with quotes) is seen here instead of the unquoted
+        # value produced by `visit_string_value`.
+        if value and value[0] in "\"'":
+            value = value[1:-1]
+        return ("path", value)
 
     def visit_textx_rule(self, node, children):
         if len(children) > 2:
@@ -720,7 +812,7 @@ class TextXVisitor(RRELVisitor):
                             raise TextXSemanticError(
                                 "Can't use bool assignment "
                                 f'inside repetition in rule "{rule_name}" '
-                                f"at {self.grammar_parser.pos_to_linecol(node.position)}."
+                                f"at {self.pos_to_linecol(node.position)}."
                             )
                         if mult_lt(cls_attr.mult, mult):
                             cls_attr.mult = mult
@@ -787,7 +879,7 @@ class TextXVisitor(RRELVisitor):
             if name not in ["skipws", "ws", "split"]:
                 raise TextXSyntaxError(
                     f'Invalid rule param "{name}" '
-                    f"at {self.grammar_parser.pos_to_linecol(node.position)}."
+                    f"at {self.pos_to_linecol(node.position)}."
                 )
 
             if name == "split" and not isinstance(value, str):
@@ -829,7 +921,13 @@ class TextXVisitor(RRELVisitor):
         rule_name = str(node)
         # Here a name of the meta-class (rule) is expected but to support
         # forward referencing we are postponing resolving to second_pass.
-        return RuleCrossRef(rule_name, rule_name, node.position, None)
+        return RuleCrossRef(
+            rule_name,
+            rule_name,
+            node.position,
+            None,
+            grammar_rule=self._current_cls.__name__,
+        )
 
     def visit_textx_rule_body(self, node, children):
         if len(children) == 1:
@@ -914,7 +1012,7 @@ class TextXVisitor(RRELVisitor):
                     # Sanity check. Modifiers do not make
                     # sense for ? operator at the moment.
                     if repeat_op == "?":
-                        line, col = self.grammar_parser.pos_to_linecol(position)
+                        line, col = self.pos_to_linecol(position)
                         raise TextXSyntaxError(
                             "Modifiers are not allowed "
                             f'for "?" operator at {(line, col)}',
@@ -969,7 +1067,7 @@ class TextXVisitor(RRELVisitor):
 
             # Cannot use operator ?= on multiple assignments
             if op == "?=":
-                line, col = self.grammar_parser.pos_to_linecol(node.position)
+                line, col = self.pos_to_linecol(node.position)
                 raise TextXSemanticError(
                     'Cannot use "?=" operator on multiple'
                     f' assignments for attribute "{attr_name}" at {(line, col)}',
@@ -1035,7 +1133,7 @@ class TextXVisitor(RRELVisitor):
             # Sanity check. Modifiers do not make
             # sense for ?= and = operator at the moment.
             if op == "?=" or op == "=":
-                line, col = self.grammar_parser.pos_to_linecol(position)
+                line, col = self.pos_to_linecol(position)
                 raise TextXSyntaxError(
                     f'Modifiers are not allowed for "{op}" operator at {(line, col)}',
                     line,
@@ -1052,7 +1150,11 @@ class TextXVisitor(RRELVisitor):
 
         attr_type = target_cls or (base_rule_name if base_rule_name else "STRING")
         if not cls_attr.cls:
-            cls_attr.cls = ClassCrossRef(cls_name=attr_type, position=node.position)
+            cls_attr.cls = ClassCrossRef(
+                cls_name=attr_type,
+                position=node.position,
+                grammar_rule=cls.__name__,
+            )
         else:
             # cls cross ref might already be set in case of multiple assignment
             # to the same attribute. If types are not the same we shall use
@@ -1100,7 +1202,7 @@ class TextXVisitor(RRELVisitor):
         try:
             regex.compile()
         except Exception as e:
-            line, col = self.grammar_parser.pos_to_linecol(node[1].position)
+            line, col = self.pos_to_linecol(node[1].position)
             raise TextXSyntaxError(str(e), line, col) from e
         return regex
 
@@ -1110,7 +1212,7 @@ class TextXVisitor(RRELVisitor):
         class_name = children[0]
         rrel_tree = None
         if class_name in BASE_TYPE_NAMES:
-            line, col = self.grammar_parser.pos_to_linecol(node.position)
+            line, col = self.pos_to_linecol(node.position)
             raise TextXSemanticError(
                 f"Primitive type instances can not be referenced at {(line, col)}.",
                 line,
@@ -1123,7 +1225,16 @@ class TextXVisitor(RRELVisitor):
         else:
             # Default rule for matching obj cross-refs
             rule_name = "ID"
-        return ("obj_ref", RuleCrossRef(rule_name, class_name, node.position, rrel_tree))
+        return (
+            "obj_ref",
+            RuleCrossRef(
+                rule_name,
+                class_name,
+                node.position,
+                rrel_tree,
+                grammar_rule=self._current_cls.__name__,
+            ),
+        )
 
     def visit_integer(self, node, children):
         return int(node.value)
@@ -1186,9 +1297,20 @@ def language_from_str(language_def, metamodel, file_name):
             e.message, e.line, e.col, filename=e.parser.file_name, context=e.context
         ) from e
 
-    # Construct new parser and meta-model based on the given language
-    # description.
-    lang_parser = visit_parse_tree(parse_tree, TextXVisitor(parser, metamodel))
+    # Keep track of the grammar file being processed. Used to resolve
+    # relative file imports and to report errors against the right file.
+    metamodel._file_stack.append(file_name)
+    try:
+        # Construct new parser and meta-model based on the given language
+        # description.
+        lang_parser = visit_parse_tree(
+            parse_tree,
+            TextXVisitor(
+                parser, metamodel, file_name=file_name, grammar_def=language_def
+            ),
+        )
+    finally:
+        metamodel._file_stack.pop()
 
     # Meta-model is constructed. Validate its semantics.
     metamodel.validate()

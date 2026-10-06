@@ -1,0 +1,6 @@
+import "types.tx" as types
+import "flatten.tx" as types
+
+Entity:
+    'entity' t=types.Type
+;

@@ -1,0 +1,5 @@
+import "../types.tx" as types
+
+Entity:
+    'entity' t=types.Missing
+;

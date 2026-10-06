@@ -14,6 +14,18 @@ please take a look at related PRs and issues and see if the change affects you.
 
 ## [Unreleased]
 
+### Added
+- Namespaced grammar imports: `import "types.tx" as types` makes the imported
+  rules visible only through the namespace prefix (e.g. `types.Type`) without
+  flattening them into the importing grammar. Unqualified references resolve
+  only in the current grammar and the builtin BASETYPE rules; a name found in
+  multiple aliased imports reports an ambiguity error listing all candidate
+  namespaces. Nested imports are supported through chained prefixes
+  (`b.c.X`), import cycles are detected at meta-model construction with the
+  cycle path in the message, and failed reference resolution reports the
+  grammar file, rule, position and the searched namespaces in a deterministic
+  order.
+
 ### Changed
 - **(BIC)** Reworked registration API: `LanguageDesc` and `GeneratorDesc` now
   require their core parameter as a positional argument. `LanguageDesc(name,

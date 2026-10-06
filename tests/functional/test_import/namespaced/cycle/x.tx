@@ -1,0 +1,5 @@
+import "y.tx" as y
+
+X:
+    'x' r=y.Y
+;

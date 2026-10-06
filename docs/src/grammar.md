@@ -1036,6 +1036,50 @@ referring object.
 `List` from `component.types` is matched/instantiated and set to `a` attribute.
 
 
+### Namespaced imports
+
+An imported grammar can be given a namespace alias using `as`:
+
+    import "types.tx" as types
+
+Rules imported this way are visible only through the namespace prefix (e.g.
+`types.Type`). They do not occupy rule names of the importing grammar, so
+defining a local rule with the same name does not clash with an imported one.
+
+Unqualified rule references are resolved only in the current grammar and the
+builtin BASETYPE rules. If a name exists in aliased imports it must be used
+with the prefix; otherwise an error is reported. When the same rule name is
+defined in multiple aliased imports the unqualified reference is ambiguous and
+the error lists all candidate namespaces:
+
+    Ambiguous reference "Type": defined in multiple imported namespaces:
+    a, b. Use a qualified reference (e.g. "a.Type").
+
+The import path is resolved relative to the importing grammar file, so
+relative paths (e.g. `"../common/types.tx"`) are supported.
+
+Imports can be nested. If grammar `a.tx` imports `b.tx` as `b` and `b.tx`
+imports `c.tx` as `c`, a rule of `c.tx` can be referenced from `a.tx` using
+the chained prefix:
+
+    import "b.tx" as b
+
+    A:
+        x = b.c.Base
+    ;
+
+Import cycles (including self-imports) are detected at meta-model
+construction time and the error message contains the cycle path.
+
+Reference resolution errors report the grammar file, the rule and the
+position of the reference, together with the namespaces that were searched,
+in a deterministic order.
+
+An import without the `as` alias (both the dot-notation form `import
+component.types` and the file path form `import "types.tx"`) keeps the
+historical behavior: imported rules are searched by unqualified references in
+the order of the imports.
+
 ## Inspecting textX grammars programmatically
 
 Since textX is a meta-language (a language for language definition) any textual

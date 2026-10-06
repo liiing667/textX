@@ -1,0 +1,5 @@
+import "self.tx" as me
+
+Self:
+    'self' r=me.Self
+;

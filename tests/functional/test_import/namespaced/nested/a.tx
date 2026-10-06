@@ -1,0 +1,5 @@
+import "b.tx" as b
+
+A:
+    'a' x=b.c.Base
+;

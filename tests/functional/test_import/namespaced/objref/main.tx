@@ -1,0 +1,10 @@
+import "types.tx" as types
+
+Model:
+    types+=types.Type
+    entities+=Entity
+;
+
+Entity:
+    'entity' name=ID 'uses' ref=[types.Type]
+;

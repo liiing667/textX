@@ -1,0 +1,6 @@
+import "left.tx" as left
+import "right.tx" as right
+
+Top:
+    'top' a=left.shared.Base b=right.shared.Base
+;

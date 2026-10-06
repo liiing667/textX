@@ -12,7 +12,7 @@ ImportOrReferenceStm:
 ;
 
 ImportStm:
-    'import' grammar_to_import=GrammarToImport
+    'import' grammar_to_import=GrammarToImport ('as' import_alias=ID)?
 ;
 
 ReferenceStm:
@@ -20,7 +20,15 @@ ReferenceStm:
 ;
 
 GrammarToImport:
+    DottedImport | StringImport
+;
+
+DottedImport:
     /(\w|\.)+/
+;
+
+StringImport:
+    STRING
 ;
 
 LanguageName:
@@ -116,7 +124,7 @@ Reference:
 ;
 
 RuleRef:
-    builtin=BuiltinRuleRef | plain=ID
+    builtin=BuiltinRuleRef | plain=QualifiedIdent
 ;
 
 BuiltinRuleRef:
@@ -146,7 +154,7 @@ RRELParent: 'parent' '(' type=ID ')';
 
 
 QualifiedIdent:
-    /\w+(\.\w+)?/
+    /\w+(\.\w+)*/
 ;
 
 // Comments

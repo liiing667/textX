@@ -1,0 +1,6 @@
+import "types_a.tx" as a
+import "types_b.tx" as b
+
+Entity:
+    'entity' x=a.Type y=b.Type
+;
